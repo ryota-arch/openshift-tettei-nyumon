@@ -11,17 +11,28 @@ spec:
     # Jenkins と接続する JNLP コンテナ（Java 17 必須）
     - name: jnlp
       image: jenkins/inbound-agent:latest-jdk17
-      args: ['\\${computer.jnlpmac}', '\\${computer.name}']
+      # JNLP には Jenkins が渡すデフォルトの 2 引数を使う（ここで env.NODE_NAME は未確定）
+      args: ['\\$(JENKINS_SECRET)', '\\$(JENKINS_NAME)']
       env:
         - name: JENKINS_URL
           value: "http://jenkins:8080/"
+        # Pod 名 = Jenkins の NODE_NAME を Downward API で注入
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
 
     # ビルド/テスト用の Maven コンテナ（Java 17）
     - name: maven
       image: maven:3.9.6-eclipse-temurin-17
-      command: ["cat"]            # 待機させるおまじない
+      command: ["cat"]
       tty: true
       workingDir: /workspace
+      env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
 
     # テスト用 PostgreSQL
     - name: postgres
@@ -30,6 +41,10 @@ spec:
         - { name: POSTGRESQL_USER,     value: 'freelancer' }
         - { name: POSTGRESQL_PASSWORD, value: 'password' }
         - { name: POSTGRESQL_DATABASE, value: 'freelancerdb_test' }
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
 """.stripIndent()
     }
   }
@@ -46,10 +61,8 @@ spec:
   }
 
   stages {
-
     stage('Checkout') {
       steps {
-        // Declarative だと SCM 設定済みなら自動 checkout されますが、明示しておく
         checkout scm
       }
     }
@@ -67,13 +80,11 @@ spec:
 
     stage('Application test') {
       steps {
-        // テストデータ投入（DB コンテナ内で実行）
         container('postgres') {
           dir('chap18/jenkins_pipeline') {
             sh "PGPASSWORD=password psql -U freelancer -d freelancerdb_test -h 127.0.0.1 -f etc/testdata.sql"
           }
         }
-        // ユニットテスト（Maven コンテナ）
         container('maven') {
           dir('chap18/jenkins_pipeline') {
             sh 'mvn test'
@@ -87,26 +98,19 @@ spec:
     }
 
     stage('Image Build') {
-      when {
-        expression {
-          return env.GIT_BRANCH == "${deploy_branch}" || params.FORCE_FULL_BUILD
-        }
-      }
+      when { expression { env.GIT_BRANCH == "${deploy_branch}" || params.FORCE_FULL_BUILD } }
       steps {
-        echo "Building OpenShift container image"
+        echo "Building OpenShift container image on node ${env.NODE_NAME}"
         dir('chap18/jenkins_pipeline') {
           script {
             openshift.withCluster() {
               openshift.withProject("${deploy_project}") {
-                // BuildConfig のテンプレ適用
                 openshift.apply(openshift.process(
                   '-f', 'openshift/application-build.yaml',
                   '-p', "NAME=${app_name}"
                 ))
-                // JAR からビルド実行
                 openshift.selector("bc", "${app_name}")
                   .startBuild("--from-file=./target/freelancer-service.jar", "--wait=true")
-                // Git のコミットハッシュでタグ付け
                 openshift.tag("${app_name}:latest", "${app_name}:${env.GIT_COMMIT}")
               }
             }
@@ -116,18 +120,13 @@ spec:
     }
 
     stage('Application deploy') {
-      when {
-        expression {
-          return env.GIT_BRANCH == "${deploy_branch}" || params.FORCE_FULL_BUILD
-        }
-      }
+      when { expression { env.GIT_BRANCH == "${deploy_branch}" || params.FORCE_FULL_BUILD } }
       steps {
-        echo "Deploying to OpenShift"
+        echo "Deploying from node ${env.NODE_NAME}"
         dir('chap18/jenkins_pipeline') {
           script {
             openshift.withCluster() {
               openshift.withProject("${deploy_project}") {
-                // デプロイ適用
                 openshift.apply(openshift.process(
                   '-f', 'openshift/application-deploy.yaml',
                   '-p', "NAME=${app_name}",
@@ -135,7 +134,6 @@ spec:
                   "-p", "APP_IMAGE_TAG=${env.GIT_COMMIT}"
                 ))
 
-                // RC の Ready を待つ
                 def dc = openshift.selector("dc", "${app_name}").object()
                 def dc_version = dc.status.latestVersion
                 echo "Waiting for RC ${app_name}-${dc_version} to be ready"
@@ -145,8 +143,8 @@ spec:
                     rc = openshift.selector("rc", "${app_name}-${dc_version}").object()
                     def desired = rc?.spec?.replicas ?: 0
                     def ready   = rc?.status?.readyReplicas ?: 0
-                    echo "Desired=${desired} Ready=${ready}"
-                    return desired > 0 && ready >= desired
+                    echo "Node=${env.NODE_NAME} Desired=${desired} Ready=${ready}"
+                    desired > 0 && ready >= desired
                   }
                 }
               }
@@ -157,23 +155,20 @@ spec:
     }
 
     stage('Application integration test') {
-      when {
-        expression {
-          return env.GIT_BRANCH == "${deploy_branch}" || params.FORCE_FULL_BUILD
-        }
-      }
+      when { expression { env.GIT_BRANCH == "${deploy_branch}" || params.FORCE_FULL_BUILD } }
       steps {
         script {
           openshift.withCluster() {
             openshift.withProject("${deploy_project}") {
               def route = openshift.selector("route", "${app_name}").object()
               def url = "http://${route.spec.host}"
-              echo "Probing ${url}/hello"
+              echo "Probing ${url}/hello from ${env.NODE_NAME}"
               timeout(time: 5, unit: 'MINUTES') {
                 waitUntil {
-                  def code = sh(returnStdout: true, script: "curl ${url}/hello -o /dev/null -w '%{http_code}' -s || true").trim()
+                  def code = sh(returnStdout: true,
+                                script: "curl ${url}/hello -o /dev/null -w '%{http_code}' -s || true").trim()
                   echo "HTTP ${code}"
-                  return code == "200"
+                  code == "200"
                 }
               }
             }
@@ -185,7 +180,7 @@ spec:
 
   post {
     always {
-      echo "Pipeline finished (result: ${currentBuild.currentResult})"
+      echo "Pipeline finished on node: ${env.NODE_NAME} (result: ${currentBuild.currentResult})"
     }
   }
 }
