@@ -1,30 +1,41 @@
 pipeline {
-  // pipelineを実行するagentの設定。
-  // JenkinsのGUI上からagentの設定が可能だが、
-  // Jenkinsfileに記載することでGit管理できる対象が増えるのでおすすめ
   agent {
     kubernetes {
       cloud 'openshift'
       yaml """\
-        apiVersion: v1
-        kind: Pod
-        spec:
-          serviceAccountName: jenkins
-          containers:
-            - name: jnlp
-              image: image-registry.openshift-image-registry.svc:5000/jenkins/custom-jenkins-agent
-              args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
-            - name: postgres
-              image: image-registry.openshift-image-registry.svc:5000/openshift/postgresql:12
-              env:
-                - name: POSTGRESQL_USER
-                  value: 'freelancer'
-                - name: POSTGRESQL_PASSWORD
-                  value: 'password'
-                - name: POSTGRESQL_DATABASE
-                  value: 'freelancerdb_test'
-        """.stripIndent()
+apiVersion: v1
+kind: Pod
+spec:
+  serviceAccountName: jenkins
+  containers:
+    # Jenkins と接続する JNLP コンテナ（Java 17 必須）
+    - name: jnlp
+      image: jenkins/inbound-agent:latest-jdk17
+      args: ['\\${computer.jnlpmac}', '\\${computer.name}']
+      env:
+        - name: JENKINS_URL
+          value: "http://jenkins:8080/"
+
+    # ビルド/テスト用の Maven コンテナ（Java 17）
+    - name: maven
+      image: maven:3.9.6-eclipse-temurin-17
+      command: ["cat"]            # 待機させるおまじない
+      tty: true
+      workingDir: /workspace
+
+    # テスト用 PostgreSQL
+    - name: postgres
+      image: image-registry.openshift-image-registry.svc:5000/openshift/postgresql:12
+      env:
+        - { name: POSTGRESQL_USER,     value: 'freelancer' }
+        - { name: POSTGRESQL_PASSWORD, value: 'password' }
+        - { name: POSTGRESQL_DATABASE, value: 'freelancerdb_test' }
+""".stripIndent()
     }
+  }
+
+  parameters {
+    booleanParam(name: 'FORCE_FULL_BUILD', defaultValue: false, description: 'main 以外でも Image Build/Deploy を実行する')
   }
 
   environment {
@@ -35,55 +46,67 @@ pipeline {
   }
 
   stages {
+
+    stage('Checkout') {
+      steps {
+        // Declarative だと SCM 設定済みなら自動 checkout されますが、明示しておく
+        checkout scm
+      }
+    }
+
     stage('Application build') {
       steps {
         dir('chap18/jenkins_pipeline') {
-          sh 'mvn -version'
-
-          // アプリケーションのビルド
-          sh 'mvn clean package -DskipTests'
+          container('maven') {
+            sh 'mvn -version'
+            sh 'mvn clean package -DskipTests'
+          }
         }
       }
     }
 
     stage('Application test') {
       steps {
-        dir('chap18/jenkins_pipeline') {
-          // テスト用DBへテストデータのロード
-          sh 'PGPASSWORD=password psql -U freelancer -d freelancerdb_test -h localhost -f etc/testdata.sql'
-
-          // ユニットテスト実行
-          sh 'mvn test'
-
-          // ユニットテストの結果を保存
-          junit allowEmptyResults: true,
-                keepLongStdio: true,
-                healthScaleFactor: 2.0,
-                testResults: '**/target/surefire-reports/TEST-*.xml'
+        // テストデータ投入（DB コンテナ内で実行）
+        container('postgres') {
+          dir('chap18/jenkins_pipeline') {
+            sh "PGPASSWORD=password psql -U freelancer -d freelancerdb_test -h 127.0.0.1 -f etc/testdata.sql"
+          }
+        }
+        // ユニットテスト（Maven コンテナ）
+        container('maven') {
+          dir('chap18/jenkins_pipeline') {
+            sh 'mvn test'
+            junit allowEmptyResults: true,
+                  keepLongStdio: true,
+                  healthScaleFactor: 2.0,
+                  testResults: '**/target/surefire-reports/TEST-*.xml'
+          }
         }
       }
     }
 
     stage('Image Build') {
-      // mainブランチのみ実行
       when {
         expression {
           return env.GIT_BRANCH == "${deploy_branch}" || params.FORCE_FULL_BUILD
         }
       }
-
       steps {
         echo "Building OpenShift container image"
         dir('chap18/jenkins_pipeline') {
           script {
             openshift.withCluster() {
               openshift.withProject("${deploy_project}") {
-                // BuildConfigのマニフェストを適用
-                openshift.apply(openshift.process('-f', 'openshift/application-build.yaml', '-p', "NAME=${app_name}"))
-                
-                // BuildConfigを実行
-                openshift.selector("bc", "${app_name}").startBuild("--from-file=./target/freelancer-service.jar", "--wait=true")
-                // ビルドしたイメージに対して、Gitのコミットハッシュ値でタグ付け
+                // BuildConfig のテンプレ適用
+                openshift.apply(openshift.process(
+                  '-f', 'openshift/application-build.yaml',
+                  '-p', "NAME=${app_name}"
+                ))
+                // JAR からビルド実行
+                openshift.selector("bc", "${app_name}")
+                  .startBuild("--from-file=./target/freelancer-service.jar", "--wait=true")
+                // Git のコミットハッシュでタグ付け
                 openshift.tag("${app_name}:latest", "${app_name}:${env.GIT_COMMIT}")
               }
             }
@@ -93,31 +116,38 @@ pipeline {
     }
 
     stage('Application deploy') {
-      // mainブランチのみ実行
       when {
         expression {
           return env.GIT_BRANCH == "${deploy_branch}" || params.FORCE_FULL_BUILD
         }
       }
-
       steps {
-        echo "deploy"
+        echo "Deploying to OpenShift"
         dir('chap18/jenkins_pipeline') {
           script {
             openshift.withCluster() {
               openshift.withProject("${deploy_project}") {
-                // アプリケーションマニフェストを適用（デプロイ）
-                openshift.apply(openshift.process('-f', 'openshift/application-deploy.yaml', '-p', "NAME=${app_name}", '-p', "APP_IMAGE=${app_image}", "-p", "APP_IMAGE_TAG=${env.GIT_COMMIT}"))
+                // デプロイ適用
+                openshift.apply(openshift.process(
+                  '-f', 'openshift/application-deploy.yaml',
+                  '-p', "NAME=${app_name}",
+                  '-p', "APP_IMAGE=${app_image}",
+                  "-p", "APP_IMAGE_TAG=${env.GIT_COMMIT}"
+                ))
 
-                // アプリケーションが期待するPod数になるまで待機
+                // RC の Ready を待つ
                 def dc = openshift.selector("dc", "${app_name}").object()
                 def dc_version = dc.status.latestVersion
-                def rc = openshift.selector("rc", "${app_name}-${dc_version}").object()
-
-                echo "Waiting for ReplicationController ${app_name}-${dc_version} to be ready"
-                while (rc.spec.replicas != rc.status.readyReplicas) {
-                  sleep 5
-                  rc = openshift.selector("rc", "${app_name}-${dc_version}").object()
+                echo "Waiting for RC ${app_name}-${dc_version} to be ready"
+                def rc
+                timeout(time: 10, unit: 'MINUTES') {
+                  waitUntil {
+                    rc = openshift.selector("rc", "${app_name}-${dc_version}").object()
+                    def desired = rc?.spec?.replicas ?: 0
+                    def ready   = rc?.status?.readyReplicas ?: 0
+                    echo "Desired=${desired} Ready=${ready}"
+                    return desired > 0 && ready >= desired
+                  }
                 }
               }
             }
@@ -125,36 +155,37 @@ pipeline {
         }
       }
     }
-    
-    // アプリケーションのデプロイ後に疎通テストをする場合
+
     stage('Application integration test') {
-      // mainブランチのみ実行
       when {
         expression {
           return env.GIT_BRANCH == "${deploy_branch}" || params.FORCE_FULL_BUILD
         }
       }
-
       steps {
         script {
           openshift.withCluster() {
             openshift.withProject("${deploy_project}") {
-              // Routeリソースからアプリケーションのホスト名を取得
-              def dc = openshift.selector("route", "${app_name}").object()
-              def url = dc.spec.host
-              echo "${url}"
-
-              while (true) {
-                def app_status = sh(returnStdout: true, script: "curl ${url}/hello -o /dev/null -w '%{http_code}' -s").trim()
-                if(app_status == "200") {
-                  break;
+              def route = openshift.selector("route", "${app_name}").object()
+              def url = "http://${route.spec.host}"
+              echo "Probing ${url}/hello"
+              timeout(time: 5, unit: 'MINUTES') {
+                waitUntil {
+                  def code = sh(returnStdout: true, script: "curl ${url}/hello -o /dev/null -w '%{http_code}' -s || true").trim()
+                  echo "HTTP ${code}"
+                  return code == "200"
                 }
-                sleep 5
               }
             }
           }
         }
       }
+    }
+  }
+
+  post {
+    always {
+      echo "Pipeline finished (result: ${currentBuild.currentResult})"
     }
   }
 }
