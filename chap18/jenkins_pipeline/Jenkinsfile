@@ -88,13 +88,15 @@ spec:
             sh 'mvn clean package -DskipTests'
             // ここで @tmp を作成＆ 1777 にしておく（この後、postgres など別UIDのコンテナでも書けるように）
             sh '''
-              set -eux
-              : "${WORKSPACE:=/home/jenkins/agent/workspace}"
-              # ジョブの実ワークスペースは $WORKSPACE/<job> なので cd しておくと確実
-              cd "$WORKSPACE" || true
-              mkdir -p "$WORKSPACE/@tmp"
-              chmod 1777 "$WORKSPACE" "$WORKSPACE/@tmp"
-              '''
+             set -eux
+              WS="${WORKSPACE:-/home/jenkins/agent/workspace}"
+              mkdir -p "$WS/@tmp" \
+                   "$WS/chap18/jenkins_pipeline/@tmp"
+              chmod 1777 "$WS" \
+                     "$WS/@tmp" \
+                     "$WS/chap18/jenkins_pipeline" \
+                     "$WS/chap18/jenkins_pipeline/@tmp"
+             '''
           }
         }
       }
@@ -102,7 +104,17 @@ spec:
 
     stage('Application test') {
       steps {
-        container('postgres') {
+            container('postgres') {
+              sh '''
+                set -eux
+                WS="${WORKSPACE:-/home/jenkins/agent/workspace}"
+                mkdir -p "$WS/@tmp" \
+                         "$WS/chap18/jenkins_pipeline/@tmp"
+                chmod 1777 "$WS" \
+                           "$WS/@tmp" \
+                           "$WS/chap18/jenkins_pipeline" \
+                           "$WS/chap18/jenkins_pipeline/@tmp"
+              '''
           dir('chap18/jenkins_pipeline') {
             sh "PGPASSWORD=password psql -U freelancer -d freelancerdb_test -h 127.0.0.1 -f etc/testdata.sql"
           }
