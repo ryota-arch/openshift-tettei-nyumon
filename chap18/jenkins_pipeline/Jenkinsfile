@@ -94,7 +94,7 @@ spec:
               cd "$WORKSPACE" || true
               mkdir -p "$WORKSPACE/@tmp"
               chmod 1777 "$WORKSPACE" "$WORKSPACE/@tmp"
-　　　　　　　'''
+              '''
           }
         }
       }
