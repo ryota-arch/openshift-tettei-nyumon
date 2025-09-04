@@ -47,6 +47,8 @@ spec:
     # テスト用 PostgreSQL（サーバ本体）: エントリポイントそのまま
     - name: postgres
       image: image-registry.openshift-image-registry.svc:5000/openshift/postgresql:12
+      ports:
+        - containerPort: 5432
       env:
         - { name: POSTGRESQL_USER,     value: 'freelancer' }
         - { name: POSTGRESQL_PASSWORD, value: 'password' }
@@ -76,10 +78,10 @@ spec:
   }
 
   environment {
-    deploy_branch = "origin/main"
+    deploy_branch  = "origin/main"
     deploy_project = "user-app"
-    app_name = 'tettei-nyumon'
-    app_image = "image-registry.openshift-image-registry.svc:5000/${deploy_project}/${app_name}"
+    app_name       = 'tettei-nyumon'
+    app_image      = "image-registry.openshift-image-registry.svc:5000/${deploy_project}/${app_name}"
   }
 
   stages {
@@ -117,8 +119,9 @@ spec:
             sh '''
               set -eux
               export PGPASSWORD=password
-              # DB 起動待ち
-              until pg_isready -h 127.0.0.1 -U freelancer -d freelancerdb_test -t 1; do
+              # DB 起動待ち（最大 ~120 秒）
+              for i in $(seq 1 60); do
+                pg_isready -h 127.0.0.1 -U freelancer -d freelancerdb_test -t 1 && break
                 sleep 2
               done
               # テストデータ投入
@@ -181,6 +184,7 @@ spec:
                   '-p', "APP_IMAGE=${app_image}",
                   "-p", "APP_IMAGE_TAG=${env.GIT_COMMIT}"
                 ))
+
                 def dc = openshift.selector("dc", "${app_name}").object()
                 def dc_version = dc.status.latestVersion
                 echo "Waiting for RC ${app_name}-${dc_version} to be ready"
