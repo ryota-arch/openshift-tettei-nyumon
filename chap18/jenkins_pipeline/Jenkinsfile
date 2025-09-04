@@ -44,11 +44,9 @@ spec:
         - name: ws
           mountPath: /home/jenkins/agent
 
-    # テスト用 PostgreSQL
+    # テスト用 PostgreSQL（サーバ本体）: エントリポイントそのまま
     - name: postgres
       image: image-registry.openshift-image-registry.svc:5000/openshift/postgresql:12
-      command: ["cat"]
-      tty: true
       env:
         - { name: POSTGRESQL_USER,     value: 'freelancer' }
         - { name: POSTGRESQL_PASSWORD, value: 'password' }
@@ -57,6 +55,15 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
+      volumeMounts:
+        - name: ws
+          mountPath: /home/jenkins/agent
+
+    # 追加：psql 実行用の待機サイドカー（ここに exec する）
+    - name: psql
+      image: image-registry.openshift-image-registry.svc:5000/openshift/postgresql:12
+      command: ["cat"]
+      tty: true
       volumeMounts:
         - name: ws
           mountPath: /home/jenkins/agent
@@ -77,9 +84,7 @@ spec:
 
   stages {
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
     stage('Application build') {
@@ -88,17 +93,17 @@ spec:
           container('maven') {
             sh 'mvn -version'
             sh 'mvn clean package -DskipTests'
-            // ここで @tmp を作成＆ 1777 にしておく（この後、postgres など別UIDのコンテナでも書けるように）
+            // durable-task の一時ディレクトリを作成（異 UID からも書けるよう 1777）
             sh '''
-             set -eux
+              set -eux
               WS="${WORKSPACE:-/home/jenkins/agent/workspace}"
               mkdir -p "$WS/@tmp" \
-                   "$WS/chap18/jenkins_pipeline/@tmp"
+                       "$WS/chap18/jenkins_pipeline/@tmp"
               chmod 1777 "$WS" \
-                     "$WS/@tmp" \
-                     "$WS/chap18/jenkins_pipeline" \
-                     "$WS/chap18/jenkins_pipeline/@tmp"
-             '''
+                         "$WS/@tmp" \
+                         "$WS/chap18/jenkins_pipeline" \
+                         "$WS/chap18/jenkins_pipeline/@tmp"
+            '''
           }
         }
       }
@@ -106,22 +111,21 @@ spec:
 
     stage('Application test') {
       steps {
-           container('postgres') {
-             // まず durable-task 用の @tmp を作って1777に（ジョブルート＋サブディレクトリ）
-             sh '''
-               set -eux
-               WS="${WORKSPACE:-/home/jenkins/agent/workspace}"
-               mkdir -p "$WS/@tmp" \
-                        "$WS/chap18/jenkins_pipeline/@tmp"
-               chmod 1777 "$WS" \
-                          "$WS/@tmp" \
-                          "$WS/chap18/jenkins_pipeline" \
-                          "$WS/chap18/jenkins_pipeline/@tmp"
-             '''
-             dir('chap18/jenkins_pipeline') {
-               sh "PGPASSWORD=password psql -U freelancer -d freelancerdb_test -h 127.0.0.1 -f etc/testdata.sql"
-             }
-           }
+        // DB は 'postgres' で起動中。psql 実行は 'psql' サイドカーへ exec する
+        container('psql') {
+          dir('chap18/jenkins_pipeline') {
+            sh '''
+              set -eux
+              export PGPASSWORD=password
+              # DB 起動待ち
+              until pg_isready -h 127.0.0.1 -U freelancer -d freelancerdb_test -t 1; do
+                sleep 2
+              done
+              # テストデータ投入
+              psql -h 127.0.0.1 -U freelancer -d freelancerdb_test -f etc/testdata.sql
+            '''
+          }
+        }
         container('maven') {
           dir('chap18/jenkins_pipeline') {
             // 念のための保険（@tmp 未作成時の権限エラー回避）
@@ -177,7 +181,6 @@ spec:
                   '-p', "APP_IMAGE=${app_image}",
                   "-p", "APP_IMAGE_TAG=${env.GIT_COMMIT}"
                 ))
-
                 def dc = openshift.selector("dc", "${app_name}").object()
                 def dc_version = dc.status.latestVersion
                 echo "Waiting for RC ${app_name}-${dc_version} to be ready"
@@ -210,7 +213,7 @@ spec:
               timeout(time: 5, unit: 'MINUTES') {
                 waitUntil {
                   def code = sh(returnStdout: true,
-                                script: "curl ${url}/hello -o /dev/null -w '%{http_code}' -s || true").trim()
+                    script: "curl ${url}/hello -o /dev/null -w '%{http_code}' -s || true").trim()
                   echo "HTTP ${code}"
                   code == "200"
                 }
