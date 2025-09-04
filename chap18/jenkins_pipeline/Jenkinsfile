@@ -86,6 +86,15 @@ spec:
           container('maven') {
             sh 'mvn -version'
             sh 'mvn clean package -DskipTests'
+            // ここで @tmp を作成＆ 1777 にしておく（この後、postgres など別UIDのコンテナでも書けるように）
+            sh '''
+              set -eux
+              : "${WORKSPACE:=/home/jenkins/agent/workspace}"
+              # ジョブの実ワークスペースは $WORKSPACE/<job> なので cd しておくと確実
+              cd "$WORKSPACE" || true
+              mkdir -p "$WORKSPACE/@tmp"
+              chmod 1777 "$WORKSPACE" "$WORKSPACE/@tmp"
+　　　　　　　'''
           }
         }
       }
