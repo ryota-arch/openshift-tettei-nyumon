@@ -47,6 +47,8 @@ spec:
     # テスト用 PostgreSQL
     - name: postgres
       image: image-registry.openshift-image-registry.svc:5000/openshift/postgresql:12
+      command: ["cat"]
+      tty: true
       env:
         - { name: POSTGRESQL_USER,     value: 'freelancer' }
         - { name: POSTGRESQL_PASSWORD, value: 'password' }
@@ -104,21 +106,22 @@ spec:
 
     stage('Application test') {
       steps {
-            container('postgres') {
-              sh '''
-                set -eux
-                WS="${WORKSPACE:-/home/jenkins/agent/workspace}"
-                mkdir -p "$WS/@tmp" \
-                         "$WS/chap18/jenkins_pipeline/@tmp"
-                chmod 1777 "$WS" \
-                           "$WS/@tmp" \
-                           "$WS/chap18/jenkins_pipeline" \
-                           "$WS/chap18/jenkins_pipeline/@tmp"
-              '''
-          dir('chap18/jenkins_pipeline') {
-            sh "PGPASSWORD=password psql -U freelancer -d freelancerdb_test -h 127.0.0.1 -f etc/testdata.sql"
-          }
-        }
+           container('postgres') {
+             // まず durable-task 用の @tmp を作って1777に（ジョブルート＋サブディレクトリ）
+             sh '''
+               set -eux
+               WS="${WORKSPACE:-/home/jenkins/agent/workspace}"
+               mkdir -p "$WS/@tmp" \
+                        "$WS/chap18/jenkins_pipeline/@tmp"
+               chmod 1777 "$WS" \
+                          "$WS/@tmp" \
+                          "$WS/chap18/jenkins_pipeline" \
+                          "$WS/chap18/jenkins_pipeline/@tmp"
+             '''
+             dir('chap18/jenkins_pipeline') {
+               sh "PGPASSWORD=password psql -U freelancer -d freelancerdb_test -h 127.0.0.1 -f etc/testdata.sql"
+             }
+           }
         container('maven') {
           dir('chap18/jenkins_pipeline') {
             // 念のための保険（@tmp 未作成時の権限エラー回避）
