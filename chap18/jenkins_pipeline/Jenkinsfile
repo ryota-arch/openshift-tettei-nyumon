@@ -64,8 +64,8 @@ spec:
     # 追加：psql 実行用の待機サイドカー（ここに exec する）
     - name: psql
       image: image-registry.openshift-image-registry.svc:5000/openshift/postgresql:12
-      command: ["cat"]
-      tty: true
+      command: ["/bin/sh","-c","trap : TERM INT; sleep infinity & wait"]
+      #tty: true
       volumeMounts:
         - name: ws
           mountPath: /home/jenkins/agent
